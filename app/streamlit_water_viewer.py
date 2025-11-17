@@ -47,7 +47,7 @@ st.caption("Carga paquetes de modelo (.joblib), muestra métricas y predice.")
 
 # -------------------- Settings -----------------------
 # El formato model_package ya contiene las métricas, no necesitamos METRICS_DIR
-MODELS_DIR = Path(".") # Asumiendo que están en la raíz, o cambia a Path("models")
+MODELS_DIR = Path("models") # Asumiendo que están en la raíz, o cambia a Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
 
 
