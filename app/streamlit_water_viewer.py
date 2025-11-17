@@ -17,185 +17,273 @@ from sklearn.metrics import (
     RocCurveDisplay,
 )
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+
+# -------------------- IMPORTANTE: Cargar Clases --------------------
+# Importa las clases personalizadas para que joblib.load() funcione.
+# Asegúrate de que CustomModels.py esté en la misma carpeta.
+try:
+    from CustomModels import (
+        BaseModel,
+        CleanPreprocessor,
+        QuantileClipper,
+        MLPClassifier,
+        DecisionTreeSolver,
+        KMeansSolver,
+        RFClassifier,
+        GradientBoostingModel,
+        LogisticRegressionModel
+    )
+    # Agrega aquí cualquier otra clase personalizada que hayas creado
+except ImportError:
+    st.error("Error: No se pudo encontrar el archivo 'CustomModels.py'. "
+             "Asegúrate de que esté en la misma carpeta que este script de Streamlit.")
+    st.stop()
 
 # -------------------- Page config --------------------
 st.set_page_config(page_title="Water Potability – Model Viewer", layout="wide")
 st.title("💧 Water Potability – Model Viewer 💧")
-st.caption("Carga modelos entrenados (.joblib) y predice un registro.")
+st.caption("Carga paquetes de modelo (.joblib), muestra métricas y predice.")
 
 # -------------------- Settings -----------------------
-MODELS_DIR = Path("models")
-METRICS_DIR = Path("metrics")
+# El formato model_package ya contiene las métricas, no necesitamos METRICS_DIR
+MODELS_DIR = Path(".") # Asumiendo que están en la raíz, o cambia a Path("models")
 MODELS_DIR.mkdir(exist_ok=True)
-METRICS_DIR.mkdir(exist_ok=True)
+
 
 # -------------------- Sidebar ------------------------
 st.sidebar.header("Modelos disponibles (.joblib)")
 model_paths = sorted(map(Path, glob.glob(str(MODELS_DIR / "*.joblib"))))
 if not model_paths:
-    st.warning("No se encontraron modelos en ./models/*.joblib. Entrena y exporta el pipeline primero.")
-selected = st.sidebar.selectbox("Selecciona el modelo", options=[p.name for p in model_paths] if model_paths else [])
-uploaded_csv = st.sidebar.file_uploader("CSV para evaluar (water_potability.csv)", type=["csv"])
+    st.warning(f"No se encontraron modelos en ./{MODELS_DIR}/*.joblib.")
+    st.stop()
+    
+selected = st.sidebar.selectbox("Selecciona el modelo", options=[p.name for p in model_paths])
+uploaded_csv = st.sidebar.file_uploader("Opcional: CSV para re-evaluar (water_potability.csv)", type=["csv"])
 
-# -------------------- Helpers ------------------------
-def load_metrics_for(model_file: Path) -> Dict[str, Any]:
-    cand = METRICS_DIR / f"{model_file.stem}.json"
-    if cand.exists():
-        try:
-            return json.loads(cand.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+# -------------------- Plotting Helpers ------------------------
 
-def try_infer_feature_names(pipeline, meta: Dict[str, Any]) -> List[str]:
-    # 1) Mejor: desde el paso 'preprocess'
-    try:
-        pre = pipeline.named_steps.get("preprocess")
-        if pre is not None and hasattr(pre, "transformers_"):
-            for _, _, cols in pre.transformers_:
-                if cols is not None:
-                    return list(cols)
-    except Exception:
-        pass
-    # 2) Fallback: si el JSON guardó feature_names
-    fn = meta.get("feature_names")
-    if isinstance(fn, list) and fn:
-        return fn
-    # 3) Sin columnas
-    return []
-
-def plot_confusion_matrix(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    fig, ax = plt.subplots()
-    im = ax.imshow(cm, interpolation="nearest")
+def plot_cm_from_saved(cm_array, labels=["No Potable (0)", "Potable (1)"]):
+    """Plotea una matriz de confusión desde un array de numpy guardado."""
+    fig, ax = plt.subplots(figsize=(4, 3))
+    im = ax.imshow(cm_array, interpolation="nearest", cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
-    ax.set(xticks=np.arange(cm.shape[1]), yticks=np.arange(cm.shape[0]))
-    ax.set_xticklabels(["Not Potable", "Potable"])
-    ax.set_yticklabels(["Not Potable", "Potable"])
+    ax.set(xticks=np.arange(cm_array.shape[1]), yticks=np.arange(cm_array.shape[0]))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
     ax.set_ylabel("True label")
     ax.set_xlabel("Predicted label")
-    thresh = cm.max() / 2.0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], "d"), ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black")
+    ax.set_title("Matriz de Confusión")
+    
+    thresh = cm_array.max() / 2.
+    for i in range(cm_array.shape[0]):
+        for j in range(cm_array.shape[1]):
+            ax.text(j, i, format(cm_array[i, j], "d"), ha="center", va="center",
+                    color="white" if cm_array[i, j] > thresh else "black")
     fig.tight_layout()
     return fig
 
-def plot_roc(y_true, y_prob):
+def plot_roc_from_saved(fpr, tpr, roc_auc):
+    """Plotea una curva ROC desde arrays guardados de fpr y tpr."""
+    fig, ax = plt.subplots(figsize=(4, 3))
+    ax.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (area = {roc_auc:.2f})")
+    ax.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.05])
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("Curva ROC")
+    ax.legend(loc="lower right")
+    fig.tight_layout()
+    return fig
+
+# --- Helpers para re-evaluación ---
+
+def plot_new_confusion_matrix(y_true, y_pred):
+    """Calcula y plotea una CM para nuevos datos."""
+    cm = confusion_matrix(y_true, y_pred)
+    return plot_cm_from_saved(cm) # Reutilizamos el helper de ploteo
+
+def plot_new_roc(y_true, y_prob):
+    """Calcula y plotea una ROC para nuevos datos."""
     fig, ax = plt.subplots()
     RocCurveDisplay.from_predictions(y_true, y_prob, ax=ax)
-    ax.set_title("ROC Curve")
+    ax.set_title("Curva ROC (Nuevos Datos)")
     fig.tight_layout()
     return fig
 
 # -------------------- Main ---------------------------
 if selected:
     path = MODELS_DIR / selected
-    with st.spinner(f"Cargando {selected}..."):
-        pipeline = joblib.load(path)
-    meta = load_metrics_for(path)
+    try:
+        with st.spinner(f"Cargando {selected}..."):
+            # 1. Cargar el model_package (diccionario)
+            model_package = joblib.load(path)
+        
+        # 2. Extraer la instancia del modelo
+        model_instance = model_package["pipeline"]
+        
+        # 3. Extraer features y métricas guardadas
+        feature_cols = model_package.get("feature_names", [])
+        saved_metrics = model_package.get("metrics", {})
+        saved_cm = model_package.get("cm")
+        saved_fpr = model_package.get("roc_fpr")
+        saved_tpr = model_package.get("roc_tpr")
+
+    except Exception as e:
+        st.error(f"Error al cargar o interpretar el archivo '{selected}':")
+        st.exception(e)
+        st.stop()
+
 
     # ---------- Predicción de un solo registro (arriba) ----------
     st.markdown("---")
-    st.header("Predicción de un solo registro")
-    #st.caption("Si no cargas CSV, inferimos las columnas del pipeline. Si no es posible, carga un CSV en la barra lateral.")
+    st.header("🔮 Predicción de un solo registro")
 
-    feature_cols = try_infer_feature_names(pipeline, meta)
     if not feature_cols:
-        st.info("No pude inferir columnas. Si cargas un CSV en la barra lateral, tomaremos los nombres de allí.")
-    # Si el usuario subió CSV, úsalo para las columnas por si el pipeline no las expone
-    if uploaded_csv is not None and not feature_cols:
-        try:
-            df_tmp = pd.read_csv(uploaded_csv)
-            df_tmp.columns = [c.strip().replace(" ", "_") for c in df_tmp.columns]
-            if "Potability" in df_tmp.columns:
-                feature_cols = [c for c in df_tmp.columns if c != "Potability"]
-        except Exception:
-            pass
+        st.info("El paquete de modelo no contenía 'feature_names'. "
+                "El formulario de predicción no puede mostrarse.")
+    else:
+        with st.form("predict_form"):
+            ui_cols = st.columns(3)
+            values = {}
+            for i, col in enumerate(feature_cols):
+                with ui_cols[i % 3]:
+                    # Usamos 0.0 para features numéricas
+                    values[col] = st.number_input(col, value=0.0, format="%f")
+            submitted = st.form_submit_button("Predecir")
 
-    # Formulario
-    with st.form("predict_form"):
-        ui_cols = st.columns(3)
-        values = {}
-        for i, col in enumerate(feature_cols or []):
-            with ui_cols[i % 3]:
-                values[col] = st.number_input(col, value=0.0)
-        submitted = st.form_submit_button("Predecir")
-
-    if submitted:
-        if not feature_cols:
-            st.warning("No hay columnas inferidas. Carga un CSV en la barra lateral o exporta un pipeline con 'preprocess'.")
-        else:
-            x = pd.DataFrame([values])
-            pred = pipeline.predict(x)[0]
-            st.success(f"Resultado: {'Potable (1)' if pred==1 else 'No potable (0)'}")
+        if submitted:
             try:
-                prob = float(pipeline.predict_proba(x)[:, 1][0])
-                st.info(f"Probabilidad clase 1 (potable): {prob:.3f}")
-            except Exception:
-                pass
+                # Crear un DataFrame con las columnas en el orden correcto
+                x = pd.DataFrame([values], columns=feature_cols)
+                
+                # Usar model_instance para predecir
+                pred = model_instance.predict(x)[0]
+                
+                st.success(f"**Resultado: {'Potable (1)' if pred==1 else 'No potable (0)'}**")
+                
+                # Intentar obtener probabilidades
+                try:
+                    prob = model_instance.predict_proba(x)
+                    # Manejar salida de proba (Keras vs Sklearn)
+                    if prob.ndim > 1:
+                        prob_potable = float(prob[0, 1])
+                    else:
+                        prob_potable = float(prob[0])
+                        
+                    st.info(f"Probabilidad de ser Potable (clase 1): **{prob_potable:.4f}**")
+                
+                except (AttributeError, NotImplementedError):
+                    st.info("Este modelo no implementa 'predict_proba()'.")
+                except Exception as prob_e:
+                    st.warning(f"No se pudieron obtener probabilidades: {prob_e}")
+                    
+            except Exception as pred_e:
+                st.error("Error durante la predicción:")
+                st.exception(pred_e)
+
+
+    # ---------- Métricas guardadas (del entrenamiento) ----------
+    st.markdown("---")
+    st.header("📈 Métricas del Set de Test (Guardadas)")
+    
+    if not saved_metrics:
+        st.info("El paquete de modelo no contenía métricas guardadas.")
+    else:
+        # Mostrar métricas clave
+        metric_keys = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+        cols = st.columns(len(metric_keys))
+        for i, key in enumerate(metric_keys):
+            value = saved_metrics.get(key)
+            if value is not None:
+                cols[i].metric(key.upper(), f"{value:.4f}")
+
+        # Mostrar plots guardados
+        left, right = st.columns(2)
+        with left:
+            if saved_cm is not None:
+                st.pyplot(plot_cm_from_saved(saved_cm), use_container_width=True)
+            else:
+                st.info("Matriz de confusión no encontrada en el paquete.")
+        
+        with right:
+            if saved_fpr is not None and saved_tpr is not None:
+                auc = saved_metrics.get("roc_auc", 0.0)
+                st.pyplot(plot_roc_from_saved(saved_fpr, saved_tpr, auc), use_container_width=True)
+            else:
+                st.info("Datos de curva ROC no encontrados en el paquete.")
+
 
     # ---------- Evaluación con CSV (si el usuario lo sube) ----------
     if uploaded_csv is not None:
         st.markdown("---")
-        st.header("📊 Resultados en CSV cargado")
+        st.header("📊 Re-evaluar con CSV cargado")
+        
         try:
             df = pd.read_csv(uploaded_csv)
             df.columns = [c.strip().replace(" ", "_") for c in df.columns]
-            assert "Potability" in df.columns, "CSV debe tener la columna 'Potability' para evaluar."
+            assert "Potability" in df.columns, "CSV debe tener la columna 'Potability'."
         except Exception as e:
             st.error(f"No pude leer el CSV: {e}")
             st.stop()
 
-        X = df.drop(columns=["Potability"]); y = df["Potability"].astype(int)
-        y_pred = pipeline.predict(X)
+        # Separar X e y
+        # Asegurarse de usar solo las columnas que el modelo espera
+        X = df[feature_cols] 
+        y = df["Potability"].astype(int)
+        
+        st.markdown(f"**Resultados de la re-evaluación en `{uploaded_csv.name}`**")
 
-        y_prob = None
-        clf = getattr(pipeline, "named_steps", {}).get("clf", None)
-        if clf is not None and hasattr(clf, "predict_proba"):
+        try:
+            # Usar model_instance para predecir
+            y_pred = model_instance.predict(X)
+            
+            y_prob = None
             try:
-                y_prob = pipeline.predict_proba(X)[:, 1]
-            except Exception:
-                y_prob = None
+                prob_array = model_instance.predict_proba(X)
+                if prob_array.ndim > 1:
+                    y_prob = prob_array[:, 1]
+                else:
+                    y_prob = prob_array
+            except (AttributeError, NotImplementedError):
+                st.info("El modelo no expone probabilidades; no se puede calcular ROC.")
 
-        # Métricas
-        cols = st.columns(5)
-        met = {
-            "accuracy": float(accuracy_score(y, y_pred)),
-            "precision": float(precision_score(y, y_pred, zero_division=0)),
-            "recall": float(recall_score(y, y_pred, zero_division=0)),
-            "f1": float(f1_score(y, y_pred, zero_division=0)),
-        }
-        if y_prob is not None:
-            try:
-                met["roc_auc"] = float(roc_auc_score(y, y_prob))
-            except Exception:
-                pass
-        for i, (k, v) in enumerate(met.items()):
-            cols[i % len(cols)].metric(k.upper(), f"{v:.3f}")
-
-        # Plots
-        left, right = st.columns(2)
-        with left:
-            st.markdown("**Matriz de confusión**")
-            st.pyplot(plot_confusion_matrix(y, y_pred), use_container_width=True)
-        with right:
+            # Métricas
+            cols = st.columns(5)
+            met = {
+                "accuracy": float(accuracy_score(y, y_pred)),
+                "precision": float(precision_score(y, y_pred, zero_division=0)),
+                "recall": float(recall_score(y, y_pred, zero_division=0)),
+                "f1": float(f1_score(y, y_pred, zero_division=0)),
+            }
             if y_prob is not None:
-                st.markdown("**Curva ROC**")
-                st.pyplot(plot_roc(y, y_prob), use_container_width=True)
-            else:
-                st.info("El modelo no expone probabilidades; no se puede trazar ROC.")
+                try:
+                    met["roc_auc"] = float(roc_auc_score(y, y_prob))
+                except Exception:
+                    pass
+            
+            for i, (k, v) in enumerate(met.items()):
+                cols[i % len(cols)].metric(k.upper(), f"{v:.4f}")
+
+            # Plots
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**Matrix de Confusión (Nuevos Datos)**")
+                st.pyplot(plot_new_confusion_matrix(y, y_pred), use_container_width=True)
+            with right:
+                if y_prob is not None:
+                    st.markdown("**Curva ROC (Nuevos Datos)**")
+                    st.pyplot(plot_new_roc(y, y_prob), use_container_width=True)
+
+        except Exception as eval_e:
+            st.error("Error durante la re-evaluación:")
+            st.exception(eval_e)
+
 
     # ---------- Metadata al final ----------
     st.markdown("---")
-    with st.expander("📄 Metadata del modelo", expanded=False):
-        st.json({
-            "model_file": selected,
-            "saved_from": meta.get("saved_from", "unknown"),
-            "model_name": meta.get("model_name", "unknown"),
-            "params": meta.get("params", {}),
-            "feature_names": meta.get("feature_names", None),
-            "commit": meta.get("commit", None),
-            "note": meta.get("note", None),
-        })
+    with st.expander("📄 Metadata del paquete del modelo", expanded=False):
+        # Mostramos el diccionario del paquete, excepto la instancia del pipeline
+        metadata_display = {k: v for k, v in model_package.items() if k != "pipeline"}
+        st.json(metadata_display, expanded_keys=["metrics", "feature_names"])
